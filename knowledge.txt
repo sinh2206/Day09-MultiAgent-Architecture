@@ -1,0 +1,150 @@
+KIẾN THỨC CẦN CÓ
+================
+
+1. Python và tổ chức dự án
+-------------------------
+- Python 3, module/package, import và cách đặt PYTHONPATH=src.
+- Dataclass, pathlib.Path, TypedDict, type hint và xử lý ngoại lệ.
+- Đọc/ghi JSON bằng ensure_ascii=False để giữ tiếng Việt UTF-8.
+- Đọc cấu hình bằng biến môi trường và python-dotenv; không ghi API key vào code
+  hoặc commit lên Git.
+- Hiểu dependency, virtual environment và cách đọc stack trace.
+
+2. LLM và prompt engineering
+----------------------------
+- Chat model nhận message/prompt và sinh phản hồi có tính xác suất; temperature=0
+  giúp routing và JSON ổn định hơn nhưng không bảo đảm tuyệt đối.
+- Mỗi agent cần một vai trò, dữ liệu đầu vào, quy tắc, schema đầu ra và điều kiện
+  dừng rõ ràng.
+- Structured output nên nhỏ, ví dụ status, needs_policy, needs_data và
+  clarification_question. Luôn cần validate/default khi LLM trả JSON lỗi.
+- Prompt phải cấm bịa dữ liệu, yêu cầu dùng tool/evidence và trả lời bằng tiếng
+  Việt. Response Agent chỉ được kết luận từ kết quả worker.
+- Phân biệt reasoning nội bộ với output: trace chỉ cần quyết định, tool call, kết
+  quả retrieval và final answer; không cần lưu suy luận dài của model.
+
+3. LangChain và tool calling
+----------------------------
+- @tool biến một hàm Python thành công cụ có tên, mô tả và schema tham số để LLM
+  lựa chọn.
+- Nên có tool nhỏ, đơn nhiệm: get_customer_by_id, get_orders_by_customer_id,
+  get_order_detail_by_order_id và get_vouchers_by_customer_id.
+- Hiểu bind_tools, AIMessage.tool_calls, ToolMessage và vòng lặp model -> tool ->
+  model. Phải giới hạn vòng lặp để tránh agent gọi tool vô hạn.
+- Mô tả tool phải nói rõ khi nào dùng và ID nào cần truyền. Kết quả tool phải có
+  status thống nhất để worker xử lý chắc chắn.
+
+4. LangGraph và kiến trúc multi-agent
+-------------------------------------
+- StateGraph mô hình hóa luồng bằng state, node và edge; compile tạo graph có thể
+  invoke.
+- Node nhận ShoppingState và chỉ trả các trường cần cập nhật.
+- Conditional edge chọn nhánh theo route của Supervisor.
+- Với câu mixed, có thể dùng luồng tuần tự policy -> data -> response (hoặc data ->
+  policy -> response) để dễ kiểm soát; cả hai kết quả cùng nằm trong state.
+- Reducer Annotated[list, operator.add] cho phép mỗi node nối thêm trace event.
+- Cần hiểu START, END, tránh nhánh không tới Response Agent và tránh ghi đè state.
+- Multi-agent ở bài này là phân tách trách nhiệm, không nhất thiết mỗi worker phải
+  dùng một model khác nhau.
+
+5. RAG (Retrieval-Augmented Generation)
+---------------------------------------
+Pipeline RAG của bài gồm:
+
+policy Markdown -> parse chunks -> embeddings -> Chroma -> top-k retrieval
+-> Policy Worker tóm tắt kèm citation
+
+Kiến thức cụ thể:
+
+- Chunking theo cấu trúc tài liệu giúp giữ đúng ngữ cảnh. Mỗi chunk phải chứa H2,
+  H3, content, citation và rendered_text; không cắt tùy ý theo số ký tự.
+- Embedding biến văn bản và truy vấn thành vector. all-MiniLM-L6-v2 được yêu cầu
+  trong rubric; adapter hiện normalize vector.
+- Vector store lưu id, document, embedding và metadata. ID cần ổn định, duy nhất.
+- Semantic search lấy top_k phần gần truy vấn nhất. Chroma thường trả distance;
+  distance nhỏ hơn biểu thị gần hơn trong metric tương ứng, không được gọi nhầm là
+  độ tin cậy tuyệt đối.
+- RAG không tự bảo đảm đúng: Policy Worker chỉ dùng các hit liên quan và phải giữ
+  citation để người dùng kiểm chứng.
+- Persistent index cần có cơ chế ensure_index và rebuild để không add trùng chunk.
+
+6. Parse Markdown có trạng thái
+-------------------------------
+- Nhận biết dòng bắt đầu bằng "## " và "### ", tránh coi "# " là H2.
+- Ghi nhớ H2 hiện tại, H3 hiện tại và buffer nội dung.
+- Khi gặp H3/H2 mới hoặc hết file, flush chunk đang có.
+- Chỉ tạo chunk khi có đủ H2 và H3; giữ nguyên bảng, danh sách, đoạn văn trong
+  content.
+- Citation nên ổn định theo dạng "policy_mock_vi.md > <H3>" hoặc gồm cả H2 và H3.
+
+7. Thiết kế truy cập dữ liệu
+----------------------------
+- Đọc JSON một lần khi khởi tạo, không đọc lại ở mỗi tool call.
+- Tạo index customer_by_id, order_by_id, orders_by_customer_id và
+  vouchers_by_customer_id để lookup gần O(1).
+- Chuẩn hóa ID đầu vào bằng strip; cần nhất quán kiểu chuỗi cho order_id/customer_id.
+- Danh sách đơn nên sắp theo created_at giảm dần rồi áp dụng limit.
+- only_active không chỉ nhìn tên mã; tối thiểu cần status == "active" và
+  remaining_uses > 0 theo dữ liệu lab.
+- Phân biệt thiếu ID (clarification_needed) với đã có ID nhưng không tồn tại
+  (not_found). Danh sách rỗng của một khách tồn tại cũng khác khách không tồn tại.
+
+8. Kiến thức nghiệp vụ của bộ policy
+------------------------------------
+- Đơn chưa giao thành công thường chưa bắt đầu quy trình trả hàng thông thường.
+- delivered là mốc thường dùng để tính cửa sổ đổi trả; completed vẫn có thể còn
+  hạn nếu chưa vượt eligible_for_return_until.
+- Thời hạn mặc định là 15 ngày cho đa số hàng thông thường, 3 ngày cho nhóm rủi ro
+  vệ sinh và 24 giờ cho hàng tươi sống/bảo quản đặc biệt; dữ liệu sản phẩm/đơn có
+  thể ghi đè.
+- Một đơn có thể dùng tối đa một voucher nền tảng, một voucher shop và một voucher
+  vận chuyển, nhưng khả năng cộng dồn còn phụ thuộc chiến dịch.
+- Hạn mức voucher theo hạng: Standard 6, Silver 8, Gold 10, Platinum 12, VIP 15.
+- Voucher khi hủy hoặc hoàn tiền không mặc nhiên được hoàn lại; phải xét hiệu lực,
+  lượt dùng và điều kiện chiến dịch.
+- Cần yêu cầu order_id/customer_id khi câu hỏi phụ thuộc dữ liệu cá nhân cụ thể.
+
+9. Kết hợp policy với data
+--------------------------
+- Policy trả lời "quy tắc là gì"; data trả lời "trường hợp này đang có dữ kiện gì".
+- Ví dụ đơn 1971: data cho biết in_transit và can_return_now=false; policy cho biết
+  đơn đang giao chưa phải đơn đã trả hàng và có thể xét hủy/từ chối nhận. Kết luận
+  phải dựa trên cả hai nguồn.
+- Ví dụ đơn 2058: data snapshot cho biết delivered,
+  eligible_for_return_until=2026-06-16 và can_return_now=true; policy cung cấp quy
+  tắc cửa sổ 15 ngày. Không tự thay snapshot bằng ngày thực tế lúc chạy bài.
+- Nếu hai nguồn mâu thuẫn, nêu rõ dữ kiện và giới hạn thay vì tự chọn một nguồn rồi
+  giấu mâu thuẫn.
+
+10. Provider abstraction
+------------------------
+- BaseChatModel cho phép graph không phụ thuộc Gemini/OpenAI/OpenRouter/Ollama/custom.
+- Mỗi provider có biến môi trường riêng; model custom hiện giả định endpoint tương
+  thích OpenAI.
+- LLM_MODEL và LLM_PROVIDER phải khớp. Cơ chế tự suy luận chỉ nhận biết rõ Gemini,
+  một số model OpenAI; các model khác nên đặt provider tường minh.
+- Ollama không cần API key nhưng cần server/model cục bộ sẵn sàng.
+
+11. Kiểm thử, quan sát và đánh giá
+---------------------------------
+- Unit test logic thuần trước: data lookup và Markdown parser.
+- Integration test tiếp theo: Chroma retrieval, tool calling, routing và graph.
+- Batch test phải so expected_route như tập hợp (không phụ thuộc thứ tự), kiểm tra
+  expected_status và expected_contains khi có.
+- Trace nên ghi timestamp, node, input tóm tắt, route, tool name/arguments, status,
+  citations/hit distance và final status; tuyệt đối không ghi API key.
+- summary.json nên có tổng số ca, pass/fail, chi tiết lỗi route/status/content.
+- Kiểm thử cả đường lỗi: JSON model không hợp lệ, collection rỗng, ID lạ, câu hỏi
+  thiếu định danh và provider lỗi.
+
+12. Chuẩn chất lượng cần nhớ
+----------------------------
+- Không hard-code đáp án cho C001, 1971 hay 2058; phải lookup dữ liệu thật.
+- Không hard-code toàn bộ routing bằng chuỗi if/else để giả lập Supervisor. Có thể
+  dùng validation/rule an toàn cho định danh, nhưng quyết định agent vẫn phải đúng
+  tinh thần routing của bài.
+- Không gom mọi lookup vào một tool chung.
+- Không trả lời policy mà thiếu citation, hoặc trộn policy/data trong cùng evidence.
+- File văn bản và JSON đầu ra phải là UTF-8, giữ nguyên dấu tiếng Việt.
+- Definition of Done: graph chạy end-to-end, đủ bốn tool, RAG/Chroma/MiniLM thật,
+  đủ ba status, batch 22 ca, trace JSON và output đúng format.

@@ -1,0 +1,179 @@
+TỔNG QUAN DỰ ÁN DAY 09 - MULTI-AGENT ARCHITECTURE
+=================================================
+
+1. Mục tiêu
+-----------
+Dự án yêu cầu xây dựng một trợ lý chăm sóc khách hàng cho nền tảng mua sắm giả lập
+VinShop Demo. Hệ thống phải dùng LLM thật, LangGraph, RAG thật và dữ liệu JSON cục
+bộ để trả lời bằng tiếng Việt ba nhóm câu hỏi:
+
+- Policy: chính sách giao hàng, đổi trả, hoàn tiền, voucher và hỗ trợ khách hàng.
+- Data: thông tin cụ thể về khách hàng, đơn hàng và voucher.
+- Mixed: kết hợp quy định trong policy với dữ liệu của một đơn hàng/khách hàng.
+
+Đây là bài tập kiến trúc multi-agent, không phải chatbot chỉ gọi một prompt. Supervisor
+phải định tuyến thật, các worker phải tạo evidence riêng và Response Agent mới tổng
+hợp câu trả lời cuối.
+
+2. Kiến trúc bắt buộc
+---------------------
+Luồng tổng quát:
+
+Người dùng
+  -> Supervisor Agent
+  -> Policy/RAG Agent và/hoặc Order/Customer Lookup Agent
+  -> Response Agent
+  -> Câu trả lời cuối
+
+Vai trò từng thành phần:
+
+- Supervisor Agent: phân tích ý định, xác định có cần policy, data hay cả hai; yêu
+  cầu làm rõ nếu câu hỏi tra cứu thiếu order_id/customer_id.
+- Worker 1 - Policy/RAG Agent: tìm kiếm semantic trong policy, rút ra quy định liên
+  quan và citation. Worker này bắt buộc gọi công cụ RAG trước khi kết luận.
+- Worker 2 - Order/Customer Lookup Agent: dùng các công cụ nhỏ, chuyên biệt để tra
+  khách hàng, danh sách đơn, chi tiết đơn và voucher.
+- Worker 3 - Response Agent: kết hợp route, policy evidence và data evidence; trả
+  một trong ba trạng thái ok, clarification_needed hoặc not_found.
+
+ShoppingState là trạng thái dùng chung, gồm question, route, policy_result,
+data_result, final_answer và trace. Trường trace dùng reducer cộng danh sách để các
+node có thể nối thêm sự kiện mà không ghi đè lịch sử.
+
+3. Nguồn dữ liệu
+----------------
+data/policy_mock_vi.md:
+
+- Knowledge base tiếng Việt có cấu trúc Markdown.
+- Nội dung chính: thuật ngữ; giao hàng; đổi trả/hoàn tiền; voucher/khuyến mãi; hỗ
+  trợ khách hàng; chống gian lận.
+- Đây chỉ là policy mô phỏng phục vụ giảng dạy, không phải chính sách chính thức
+  của một sàn thương mại điện tử.
+- Đơn vị chunk bắt buộc là: heading cấp 2 + heading cấp 3 + toàn bộ nội dung của
+  heading cấp 3.
+- Citation mẫu: policy_mock_vi.md > 5.10. Quan hệ giữa trạng thái đơn hàng và
+  quyền trả hàng.
+
+data/order_customer_mock_data.json:
+
+- Gồm bốn nhóm top-level: metadata, customers, orders và vouchers.
+- Có 80 khách hàng, 360 đơn hàng và 284 voucher.
+- Customer cung cấp hạng thành viên, hạn mức voucher, số voucher còn lại, lịch sử
+  mua sắm và thông tin tài khoản.
+- Order cung cấp trạng thái, vận chuyển, ETA, thời điểm giao, cửa sổ trả hàng,
+  can_return_now, voucher đã dùng và danh sách sản phẩm.
+- Voucher cung cấp loại mã, kiểu/giá trị giảm, điều kiện đơn tối thiểu, trạng thái,
+  lượt dùng còn lại và đơn hàng được gán.
+- Các mẫu nổi bật: C001 dùng cho câu hỏi voucher; 1971 đang in_transit và chưa thể
+  trả hàng thông thường; 2058 đã delivered và còn hạn trả theo snapshot dữ liệu;
+  9999 là mã đơn không tồn tại.
+
+Lưu ý: metadata của bộ dữ liệu lấy mốc mô phỏng 2026-06-07. Khi làm bài cần ưu tiên
+các trường nghiệp vụ đã cung cấp như can_return_now và eligible_for_return_until,
+không tự lấy ngày hệ thống hiện tại để làm thay đổi đáp án mong đợi của bộ test.
+
+data/test.json:
+
+- Gồm 22 ca Q01-Q22.
+- Bao phủ policy-only, data-only, mixed, clarification_needed và not_found.
+- Mỗi ca có expected_route, expected_status; một số ca còn có expected_contains.
+- Các ca trọng tâm: Q11-Q14, Q22 kiểm tra mixed; Q15-Q16 kiểm tra làm rõ; Q17-Q18
+  kiểm tra không tìm thấy.
+
+4. Cấu trúc mã nguồn
+--------------------
+src/app/config.py:
+Đọc .env, xác định root, provider/model, đường dẫn policy/data/Chroma/trace, tên
+embedding model và top_k. Nếu không đặt LLM_PROVIDER, provider được suy ra từ tên
+model trong một số trường hợp.
+
+src/app/state.py:
+Khai báo ShoppingState bằng TypedDict. Đây là hợp đồng dữ liệu giữa các node của
+LangGraph.
+
+src/app/data_access.py:
+ShoppingDataStore đọc JSON một lần, tạo bốn index trong bộ nhớ và cung cấp bốn
+lookup tool chuyên biệt với kết quả ok/not_found.
+
+src/app/prompts.py:
+Tách riêng prompt tiếng Việt cho Supervisor, Policy Worker, Data Worker và Response
+Worker, kèm quy tắc sử dụng evidence và schema đầu ra.
+
+src/app/graph.py:
+Trung tâm điều phối: khởi tạo LLM/data/RAG/tools, định nghĩa bốn node và conditional
+edges, xử lý một câu/batch, đánh giá kết quả và lưu trace JSON.
+
+src/app/cli.py:
+Giao diện dòng lệnh cho chế độ một câu, batch, rebuild index và chọn nơi lưu output.
+
+src/app/utils.py:
+Đã có tiện ích dump JSON UTF-8, trích JSON từ phản hồi LLM, tạo timestamp, tuần tự
+hóa LangChain message, lấy tool đã gọi và lấy nội dung AI message cuối.
+
+src/rag/embeddings.py:
+Đã có adapter SentenceTransformerEmbeddings. Model mặc định là
+sentence-transformers/all-MiniLM-L6-v2; vector được normalize trước khi trả về.
+
+src/rag/parser.py:
+Parse Markdown theo H2 + H3 + content và tạo metadata/citation ổn định.
+
+src/rag/vector_store.py:
+Cài đặt Chroma PersistentClient, tạo/rebuild collection, semantic search và tool
+search_policy.
+
+src/provider/:
+Đã có provider abstraction cho Gemini, OpenAI, OpenRouter, Ollama và endpoint custom
+tương thích OpenAI. Mỗi builder kiểm tra cấu hình cần thiết rồi trả về BaseChatModel.
+
+src/requirements.txt:
+Khai báo ChromaDB, LangChain/LangGraph, các provider integration, python-dotenv và
+sentence-transformers.
+
+5. Trạng thái sau khi hoàn thiện
+-------------------------------
+Các thành phần đã được cài đặt:
+
+- Cấu hình, state, provider abstraction, embedding loader và utility JSON/trace.
+- Bốn data indexes và bốn lookup tools nhỏ.
+- Markdown chunking đúng H2 + H3 + content.
+- Chroma persistent index, rebuild, retrieval và citation.
+- Supervisor routing, Policy Worker, Data Worker và Response Worker.
+- LangGraph end-to-end với ba trạng thái đầu ra.
+- Chạy một câu, batch 22 case, trace từng case và summary.json qua CLI.
+
+Mã nguồn không còn TODO hoặc NotImplementedError trong src/. Theo yêu cầu của người
+dùng, việc cài dependency, tạo index và chạy kiểm thử chưa được thực hiện trong lần
+hoàn thiện này; người dùng sẽ tự chạy để xác nhận với provider/môi trường thực tế.
+
+6. Hợp đồng đầu ra
+------------------
+Thành công:
+Answer: <câu trả lời tiếng Việt>
+Evidence:
+- Policy: <quy định và citation, nếu có>
+- Order data: <dữ kiện tra cứu, nếu có>
+
+Thiếu định danh cần thiết:
+Status: clarification_needed
+Question: <câu hỏi ngắn yêu cầu order_id/customer_id>
+
+Không tìm thấy thực thể đã nêu rõ:
+Status: not_found
+Message: <thông báo thực thể không tồn tại>
+
+Evidence policy và evidence data phải được phân biệt. Không được dùng policy để
+bịa dữ liệu đơn hàng hoặc dùng dữ liệu của một đơn để suy thành quy định chung.
+
+7. Tiêu chí hoàn thành
+----------------------
+Rubric có tổng 100 điểm:
+
+- 60 điểm cốt lõi: Supervisor, Policy/RAG Worker, Data Worker với ít nhất bốn tool,
+  Response Worker.
+- 30 điểm chất lượng: chunk đúng cấu trúc, Chroma + MiniLM thật, xử lý làm rõ/không
+  tìm thấy và chạy batch test.
+- 10 điểm bonus: citation, trace JSON, provider abstraction sạch và prompt tách
+  riêng.
+
+Các lỗi bị trừ điểm gồm gom lookup thành một tool chung, hard-code toàn bộ route,
+không có evidence/không phân biệt nguồn và không chạy được với dữ liệu trong repo.

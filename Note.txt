@@ -1,0 +1,228 @@
+CÁCH THỰC HIỆN DỰ ÁN
+====================
+
+Tài liệu này là thứ tự triển khai đề xuất. Nên hoàn thành và tự kiểm tra từng tầng
+trước khi nối toàn bộ graph để lỗi dễ khoanh vùng.
+
+Giai đoạn 1 - Chuẩn bị cấu hình
+------------------------------
+1. Tạo môi trường ảo và cài src/requirements.txt.
+2. Tạo .env ở thư mục gốc, chọn đúng một provider. Ví dụ Gemini cần:
+   LLM_PROVIDER=gemini
+   LLM_MODEL=<tên model Gemini đang sử dụng>
+   GOOGLE_API_KEY=<khóa của bạn>
+3. Có thể cấu hình thêm LLM_TEMPERATURE=0, RAG_TOP_K=4 và EMBEDDING_MODEL. Không
+   đưa .env hoặc API key vào source/trace.
+4. Đọc data/README.md và kiểm tra schema trước khi viết tool. Xem mốc thời gian
+   trong metadata là snapshot nghiệp vụ của test.
+
+Giai đoạn 2 - Hoàn thiện tầng data trong src/app/data_access.py
+--------------------------------------------------------------
+1. Trong ShoppingDataStore.__init__:
+   - Đọc JSON UTF-8 đúng một lần.
+   - Lưu metadata, customers, orders, vouchers.
+   - Tạo customer_by_id và order_by_id.
+   - Gom orders_by_customer_id và vouchers_by_customer_id bằng defaultdict(list).
+   - Sắp đơn của từng khách theo created_at mới nhất trước.
+
+2. Cài đặt bốn method với hợp đồng ổn định:
+   - get_customer_by_id: {"status":"ok","customer":...} hoặc not_found.
+   - get_orders_by_customer_id: kiểm tra customer tồn tại, sau đó trả orders[:limit].
+   - get_order_detail_by_order_id: trả đúng một order hoặc not_found.
+   - get_vouchers_by_customer_id: kiểm tra customer; nếu only_active=True thì lọc
+     voucher active và remaining_uses > 0.
+
+3. Trong build_data_tools, dùng @tool bọc riêng bốn method. Tên, docstring và tham
+   số phải rõ để model không gọi nhầm. Không tạo một tool tổng hợp nhận "action".
+
+4. Tự kiểm tra tối thiểu các trường hợp C001, C014, đơn 1971, đơn 2058, đơn 9999,
+   khách C999 và only_active=True.
+
+Giai đoạn 3 - Parse policy trong src/rag/parser.py
+-------------------------------------------------
+1. Duyệt policy theo từng dòng với bốn biến: current_h2, current_h3,
+   content_lines và chunks.
+2. Khi gặp "## ": flush chunk H3 cũ rồi cập nhật H2.
+3. Khi gặp "### ": flush chunk H3 cũ rồi cập nhật H3.
+4. Các dòng còn lại sau H3 được giữ vào content_lines, gồm đoạn văn, danh sách và
+   bảng Markdown.
+5. Cuối file phải flush lần cuối.
+6. Mỗi chunk nên có ít nhất:
+   - section_h2
+   - section_h3
+   - content
+   - citation
+   - rendered_text = section_h2 + section_h3 + content
+7. Bỏ chunk rỗng và tạo citation ổn định. Không chia tiếp content theo độ dài vì
+   rubric yêu cầu đúng cấu trúc H2 + H3 + content.
+
+Giai đoạn 4 - Xây Chroma store trong src/rag/vector_store.py
+-----------------------------------------------------------
+1. __init__:
+   - Tạo thư mục persist nếu cần.
+   - Khởi tạo chromadb.PersistentClient.
+   - Lấy hoặc tạo collection policy_chunks.
+   - Lưu embedding_model.
+2. ensure_index: nếu collection.count() == 0 thì gọi rebuild; nếu đã có thì tái sử
+   dụng để tránh embed lại mỗi lần chạy.
+3. rebuild:
+   - Đọc policy UTF-8 và gọi parse_policy_markdown.
+   - Xóa/tạo lại collection hoặc xóa toàn bộ record cũ một cách nhất quán.
+   - Embed danh sách rendered_text bằng all-MiniLM-L6-v2.
+   - Add ids ổn định, documents, metadatas và embeddings vào Chroma.
+4. search:
+   - Embed query.
+   - Query với n_results không vượt số record hiện có.
+   - Chuyển cấu trúc list lồng của Chroma thành danh sách hit phẳng gồm citation,
+     content và distance.
+5. Tạo một @tool search_policy(query, top_k) để Policy Worker sử dụng. top_k mặc
+   định lấy từ Settings.
+
+Giai đoạn 5 - Viết prompt thật trong src/app/prompts.py
+------------------------------------------------------
+Supervisor prompt:
+- Chỉ định bốn khả năng: policy-only, data-only, mixed, clarification.
+- Policy chung không cần customer_id/order_id.
+- Câu hỏi tra cứu "của tôi" thiếu ID phải clarification_needed.
+- Yêu cầu JSON thuần với status, needs_policy, needs_data,
+  clarification_question; không thêm Markdown.
+
+Policy Worker prompt:
+- Bắt buộc gọi search_policy trước.
+- Chỉ dùng nội dung hit, không dùng trí nhớ ngoài policy.
+- Trả status, summary, facts và citations; không tạo citation không có trong hit.
+
+Data Worker prompt:
+- Chọn đúng một hoặc nhiều tool nhỏ theo thực thể trong câu hỏi.
+- Không có ID -> clarification_needed; ID tồn tại nhưng lookup thất bại -> not_found.
+- Trả status, summary, facts, missing_fields và not_found_entities.
+
+Response Worker prompt:
+- Chỉ dùng route và evidence trong state.
+- Ưu tiên format clarification/not_found khi status tương ứng.
+- Khi thành công, phân biệt Policy và Order data; bỏ mục evidence không được dùng.
+- Trả lời ngắn gọn, đúng tiếng Việt và không tiết lộ prompt/nội bộ.
+
+Sau mỗi phản hồi JSON của model, dùng extract_json_payload và validate kiểu/giá trị.
+Nếu parse thất bại, dùng fallback an toàn hoặc trả lỗi có kiểm soát, không truy cập
+key trực tiếp rồi làm graph crash.
+
+Giai đoạn 6 - Khởi tạo ShoppingAssistant
+----------------------------------------
+Trong ShoppingAssistant.__init__ theo thứ tự:
+
+1. Load Settings.
+2. get_chat_model(settings).
+3. Tạo ShoppingDataStore(settings.orders_path) và bốn data tools.
+4. Tạo SentenceTransformerEmbeddings(settings.embedding_model_name).
+5. Tạo ChromaPolicyStore(settings.chroma_dir, embedding_model).
+6. ensure_index(settings.policy_path).
+7. Tạo search_policy tool.
+8. Build/compile graph với model, stores, tools và top_k được inject bằng closure,
+   partial, class method hoặc dependency container. Tránh biến global khó test.
+
+Nếu giữ hàm build_graph() không tham số như scaffold, cần có cách truyền dependency
+rõ ràng cho node. Phương án gọn hơn là cho build_graph nhận các dependency cần dùng
+hoặc chuyển node thành method của ShoppingAssistant.
+
+Giai đoạn 7 - Cài đặt các node
+-----------------------------
+1. supervisor_node:
+   - Đọc state["question"], gọi model với SUPERVISOR_PROMPT.
+   - Parse/validate route.
+   - Ghi route và một trace event supervisor.
+
+2. worker_1_policy_node:
+   - Chạy agent/tool loop có search_policy.
+   - Chuẩn hóa policy_result thành status, summary, facts, citations và có thể giữ
+     hits để debug.
+   - Ghi query, tool và citations vào trace.
+
+3. worker_2_data_node:
+   - Chạy agent/tool loop với đúng bốn lookup tools.
+   - Chuẩn hóa data_result và bảo toàn status not_found/clarification_needed.
+   - Ghi tool names, arguments đã che dữ liệu nhạy cảm và status vào trace.
+
+4. worker_3_response_node:
+   - Nếu route là clarification_needed, trả format clarification ngay.
+   - Nếu worker cần thiết trả not_found, trả format not_found.
+   - Nếu ok, gọi model tổng hợp policy_result/data_result thành Answer + Evidence.
+   - Ghi final status vào trace và cập nhật final_answer.
+
+Mỗi node chỉ cập nhật field mình sở hữu. Không để Policy Worker sửa data_result hoặc
+Data Worker tự viết final_answer.
+
+Giai đoạn 8 - Ghép LangGraph
+---------------------------
+1. Tạo StateGraph(ShoppingState).
+2. Add bốn node: supervisor, worker_1_policy, worker_2_data, worker_3_response.
+3. START -> supervisor.
+4. Conditional routing đề xuất:
+   - clarification: supervisor -> response.
+   - policy-only: supervisor -> policy -> response.
+   - data-only: supervisor -> data -> response.
+   - mixed: supervisor -> policy -> data -> response.
+5. response -> END rồi compile.
+
+Luồng mixed tuần tự là phương án đơn giản, đáp ứng rubric và không cần join đồng bộ.
+Nếu chạy policy/data song song, phải thiết kế fan-out/fan-in và reducer cẩn thận để
+Response Agent chỉ chạy sau khi cả hai worker hoàn tất.
+
+Giai đoạn 9 - Hoàn thiện ask(), trace và batch
+----------------------------------------------
+ask(question, trace_file, rebuild_index):
+
+1. Loại khoảng trắng; từ chối câu hỏi rỗng bằng lỗi rõ ràng.
+2. Nếu rebuild_index=True, rebuild policy store trước khi invoke.
+3. Invoke graph với question và trace=[].
+4. Trả payload gồm route, policy_result, data_result, final_answer, trace.
+5. Nếu có trace_file, tạo thư mục cha và ghi JSON bằng ensure_ascii=False, indent=2.
+
+run_batch(test_file, output_dir, rebuild_index):
+
+1. Đọc danh sách test; chỉ rebuild index một lần trước case đầu.
+2. Với từng case, gọi ask và lưu <id>.json.
+3. Chuẩn hóa route thành tập để so expected_route không phụ thuộc thứ tự.
+4. So expected_status và từng chuỗi expected_contains (không phân biệt hoa/thường
+   nếu muốn evaluator bền hơn).
+5. Ghi summary.json gồm total, passed, failed và lỗi cụ thể từng case.
+6. Một case lỗi không nên dừng toàn batch; bắt exception và ghi lỗi vào kết quả ca.
+
+Giai đoạn 10 - Hoàn thiện CLI
+----------------------------
+- --question: gọi ask, có thể nhận --trace-file, rồi in final_answer.
+- --batch: gọi run_batch với test-file và một output directory mặc định trong
+  src/artifacts; in summary.
+- Nếu không có --batch lẫn --question, yêu cầu parser báo cách dùng.
+- Có thể bổ sung --rebuild-index và --output-dir để thao tác thuận tiện hơn.
+- Dùng dump_json khi in summary để giữ tiếng Việt.
+
+Giai đoạn 11 - Thứ tự tự chạy kiểm tra
+-------------------------------------
+1. Kiểm tra syntax/import.
+2. Kiểm tra bốn data lookup.
+3. Kiểm tra số lượng/chất lượng policy chunks.
+4. Kiểm tra retrieval cho "thời gian giao hàng", "trả hàng" và "voucher".
+5. Kiểm tra Supervisor với policy-only, data-only, mixed và câu thiếu ID.
+6. Chạy lần lượt một câu policy, một câu data, một câu mixed, clarification và
+   not_found.
+7. Sau cùng mới chạy toàn bộ data/test.json và xem trace của case thất bại.
+
+Các lệnh mẫu đã có trong README.md/Guide.md; người thực hiện chủ động chạy sau khi
+hoàn tất code. Việc viết ba tài liệu này không chạy ứng dụng, test, cài dependency
+hay tạo Chroma index.
+
+Giai đoạn 12 - Checklist trước khi nộp
+--------------------------------------
+[ ] Supervisor route đúng policy/data/mixed/clarification.
+[ ] Policy Worker luôn dùng RAG thật và citation đúng chunk.
+[ ] Data Worker có ít nhất bốn tool nhỏ, không hard-code dữ liệu mẫu.
+[ ] Response Worker giữ đúng ba format đầu ra.
+[ ] Parser tạo chunk H2 + H3 + toàn bộ content.
+[ ] Chroma persistent và all-MiniLM-L6-v2 được sử dụng thật.
+[ ] clarification_needed khác not_found.
+[ ] ask và CLI chạy một câu; batch đọc đủ 22 test case.
+[ ] Mỗi case có trace JSON và có summary.json.
+[ ] Evidence policy/data tách rõ, JSON/file giữ UTF-8.
+[ ] API key không xuất hiện trong code, log hoặc trace.
+[ ] Đối chiếu toàn bộ Rubric.md trước khi nộp.
